@@ -1,11 +1,11 @@
 """
 data_collector.py
 ~~~~~~~~~~~~~~~~~
-Context‑harvesting helper for the ENCS 5342 project.
+Multi‑source context collector for LLM profiling.
 
 Sources handled
 ---------------
-wikipedia | wikidata | homepage | news | duckduckgo | dbpedia
+wikipedia | wikidata | homepage | news | duckduckgo | dbpedia | search
 """
 
 from __future__ import annotations
@@ -14,25 +14,27 @@ import re
 import textwrap
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Callable, Dict, List, Optional, Tuple
 
 import requests
 from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse
 from urllib3.util.retry import Retry
 
 
-# ---------- constants for homepage probing ---------------------------------
-_TLDS = ("edu", "com", "org", "net", "tech")
-_MAX_TRIES = 6            # max candidate domains to test
-_PROBE_TIMEOUT = 2        # seconds per request
-_THREADS = 6              # concurrent probes
+# ---------- constants -------------------------------------------------------
+_TLDS          = ("edu", "gov", "ac", "org", "com", "net", "tech")
+_MAX_TRIES     = 6     # homepage domain probes
+_PROBE_TIMEOUT = 2     # seconds per request
+_THREADS       = 6     # parallel homepage probes
+_RECENT_DAYS   = 365   # freshness window for 'search' snippets
 
 
 @dataclass
 class DataCollector:
-    sources: List[str] = field(default_factory=lambda: ["wikipedia"])
+    sources: List[str] = field(default_factory=lambda: ["wikipedia", "search"])
     timeout: int = 10
     max_chars: int = 4_096
 
@@ -42,27 +44,23 @@ class DataCollector:
 
     # --------------------------------------------------------------------- #
     def __post_init__(self):
-        retry = Retry(
-            total=3,
-            backoff_factor=0.4,
-            status_forcelist=[500, 502, 503, 504],
-            allowed_methods=frozenset(["GET", "HEAD"]),
-        )
+        retry = Retry(total=3, backoff_factor=0.4,
+                      status_forcelist=[500, 502, 503, 504],
+                      allowed_methods=frozenset(["GET", "HEAD"]))
         self.session = requests.Session()
-        # (removed custom User‑Agent)
         self.session.mount("https://", HTTPAdapter(max_retries=retry))
 
         self._FETCHERS = {
-            "wikipedia": self._fetch_wikipedia_summary,
-            "wikidata": self._fetch_wikidata_blurb,
-            "homepage": self._fetch_homepage_snippet,
-            "news": self._fetch_news_headlines,
+            "wikipedia":  self._fetch_wikipedia_summary,
+            "wikidata":   self._fetch_wikidata_blurb,
+            "homepage":   self._fetch_homepage_snippet,
+            "news":       self._fetch_news_headlines,
             "duckduckgo": self._fetch_ddg_instant,
-            "dbpedia": self._fetch_dbpedia_abstract,
+            "dbpedia":    self._fetch_dbpedia_abstract,
+            "search":     self._fetch_search_snippets,     # NEW
         }
 
     # --------------------------------------------------------------------- #
-    # public API
     def collect(self, institution: str) -> str:
         chunks, seen = [], set()
         for src in self.sources:
@@ -84,9 +82,8 @@ class DataCollector:
             merged = textwrap.shorten(merged, self.max_chars, placeholder=" …")
         return merged
 
-    # --------------------------------------------------------------------- #
-    # tiny FIFO memo
-    def _memoize(self, key: Tuple[str, str], val: Optional[str] = None) -> Optional[str]:
+    # ------------------- cache helper -------------------------------------
+    def _memoize(self, key: Tuple[str, str], val: Optional[str] = None):
         if val is None:
             return self._memo.get(key)
         if len(self._memo) >= self._MEMO_LIMIT:
@@ -94,8 +91,7 @@ class DataCollector:
         self._memo[key] = val
         return val
 
-    # --------------------------------------------------------------------- #
-    # fetchers
+    # ------------------- standard fetchers --------------------------------
     def _fetch_wikipedia_summary(self, inst: str) -> str:
         k = ("wiki", inst.lower())
         if (c := self._memoize(k)) is not None:
@@ -125,8 +121,7 @@ class DataCollector:
         k = ("news", inst.lower())
         if (c := self._memoize(k)) is not None:
             return c
-        url = "https://news.google.com/rss/search?q=" \
-              f"{quote_plus(inst)}&hl=en&gl=US&ceid=US:en"
+        url = f"https://news.google.com/rss/search?q={quote_plus(inst)}&hl=en&gl=US&ceid=US:en"
         r = self.session.get(url, timeout=self.timeout)
         soup = BeautifulSoup(r.content, "xml")
         heads = [i.title.text for i in soup.find_all("item", limit=items)]
@@ -161,17 +156,65 @@ class DataCollector:
         abstract = results[0]["abs"]["value"] if results else ""
         return self._memoize(k, abstract)
 
+    # ------------------- NEW: search fetcher ------------------------------
+    def _fetch_search_snippets(self, inst: str, k: int = 8) -> str:
+        """
+        DuckDuckGo SERP → follow result pages → extract fresh, high‑quality snippets.
+        """
+        key = ("search", inst.lower())
+        if (c := self._memoize(key)) is not None:
+            return c
+
+        serp = self.session.get(
+            f"https://duckduckgo.com/html/?q={quote_plus(inst)}",
+            timeout=6
+        )
+        soup = BeautifulSoup(serp.text, "html.parser")
+
+        snippets, picked = [], 0
+        for a in soup.select("a.result__a")[:20]:        # scan top 20 links
+            url = a["href"]
+            domain = urlparse(url).hostname or ""
+            if not any(domain.endswith("." + t) or domain == f"{t}" for t in _TLDS):
+                continue  # skip low‑quality TLDs
+
+            try:
+                page = self.session.get(url, timeout=4)
+                txt  = self._snippet_from_html(page.text)
+                date = self._extract_date(page.text)
+                if date and (datetime.utcnow() - date).days > _RECENT_DAYS:
+                    continue  # too old
+                if txt:
+                    snippets.append(txt)
+                    picked += 1
+                if picked >= k:
+                    break
+            except Exception:
+                continue
+
+        return self._memoize(key, "\n".join(snippets))
+
+    # helpers for search
+    @staticmethod
+    def _extract_date(html: str):
+        m = re.search(r"(\d{4}-\d{2}-\d{2})", html)
+        if m:
+            try:
+                return datetime.strptime(m.group(1), "%Y-%m-%d")
+            except ValueError:
+                pass
+        return None
+
     # ------------------------------------------------------------------ #
-    # homepage helpers (fast parallel probe)
+    # homepage helpers (parallel probe, unchanged)
     @staticmethod
     def _guess_domains(name: str) -> List[str]:
         clean = re.sub(r"[^\w]", " ", name).lower().split()
         base = "".join(clean)
         roots = [base]
         if base.endswith("university"):
-            roots.append(base[:-10])          # strip 'university'
-        doms = [f"{r}.{t}" for r in roots for t in _TLDS]
-        return doms[:_MAX_TRIES]
+            roots.append(base[:-10])
+        return [f"{r}.{t}" for r in roots for t in _TLDS][: _MAX_TRIES]
 
     @staticmethod
     def _snippet_from_html(html: str) -> str:
@@ -187,18 +230,14 @@ class DataCollector:
         if (c := self._memoize(k)) is not None:
             return c
 
-        session = self.session
-
-        # -- threaded probes ------------------------------------------------
         def probe(domain: str) -> str:
             for scheme in ("https://", "http://"):
                 try:
                     url = scheme + domain
-                    # cheap HEAD first
-                    h = session.head(url, timeout=_PROBE_TIMEOUT, allow_redirects=True)
+                    h = self.session.head(url, timeout=_PROBE_TIMEOUT, allow_redirects=True)
                     if h.status_code >= 400:
                         continue
-                    g = session.get(url, timeout=_PROBE_TIMEOUT)
+                    g = self.session.get(url, timeout=_PROBE_TIMEOUT)
                     if g.status_code == 200:
                         snip = self._snippet_from_html(g.text)
                         if snip:
@@ -210,25 +249,24 @@ class DataCollector:
         domains = self._guess_domains(inst)
 
         with ThreadPoolExecutor(max_workers=_THREADS) as exe:
-            futs = {exe.submit(probe, d): d for d in domains}
-            for fut in as_completed(futs):
+            futures = {exe.submit(probe, d): d for d in domains}
+            for fut in as_completed(futures):
                 snip = fut.result()
                 if snip:
-                    # cancel remaining
-                    for f in futs:
+                    for f in futures:
                         f.cancel()
                     return self._memoize(k, snip)
 
-        # -- fallback search -------------------------------------------------
+        # fallback: DuckDuckGo first result
         try:
             query = quote_plus(f"{inst} official website")
             url = f"https://duckduckgo.com/html/?q={query}"
-            r = session.get(url, timeout=_PROBE_TIMEOUT * 2)
+            r = self.session.get(url, timeout=_PROBE_TIMEOUT * 2)
             soup = BeautifulSoup(r.text, "html.parser")
             link = soup.select_one("a.result__a")
             if link and "href" in link.attrs:
                 target = link["href"]
-                r2 = session.get(target, timeout=_PROBE_TIMEOUT * 2)
+                r2 = self.session.get(target, timeout=_PROBE_TIMEOUT * 2)
                 snip = self._snippet_from_html(r2.text)
                 if snip:
                     return self._memoize(k, snip)
